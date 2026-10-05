@@ -1,0 +1,102 @@
+name: Build & publish to Roblox
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: "Published = en ligne pour les joueurs / Saved = brouillon"
+        type: choice
+        options: [Published, Saved]
+        default: Published
+
+concurrency:
+  group: roblox-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      PLACE_FILE: build/StealAnEgg.rbxl
+      # Secret (Settings > Secrets and variables > Actions > Secrets)
+      ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+      # Variables (Settings > Secrets and variables > Actions > Variables)
+      ROBLOX_UNIVERSE_ID: ${{ vars.ROBLOX_UNIVERSE_ID }}
+      ROBLOX_PLACE_ID: ${{ vars.ROBLOX_PLACE_ID }}
+      VERSION_TYPE: ${{ inputs.version_type || vars.ROBLOX_VERSION_TYPE || 'Published' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Rojo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$HOME/.local/bin" /tmp/rojo
+          gh release download --repo rojo-rbx/rojo --pattern '*linux-x86_64.zip' --dir /tmp/rojo
+          unzip -o /tmp/rojo/*.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/rojo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Construire le fichier de place (.rbxl)
+        run: |
+          rojo --version
+          mkdir -p build
+          rojo build default.project.json --output "$PLACE_FILE"
+          ls -lh "$PLACE_FILE"
+
+      # Toujours disponible en téléchargement : sert aussi à créer l'expérience la 1re fois
+      - name: Sauvegarder le .rbxl en artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StealAnEgg-place
+          path: build/StealAnEgg.rbxl
+          retention-days: 14
+
+      - name: Vérifier la configuration Roblox
+        id: config
+        run: |
+          missing=""
+          if [ -z "$ROBLOX_API_KEY" ]; then missing="$missing secret:ROBLOX_API_KEY"; fi
+          if [ -z "$ROBLOX_UNIVERSE_ID" ]; then missing="$missing variable:ROBLOX_UNIVERSE_ID"; fi
+          if [ -z "$ROBLOX_PLACE_ID" ]; then missing="$missing variable:ROBLOX_PLACE_ID"; fi
+
+          if [ -n "$missing" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Publication ignorée, configuration manquante :$missing"
+            cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## ⚠️ Expérience Roblox pas encore configurée
+
+          Manquant :$missing
+
+          L'API Roblox ne permet pas de créer une expérience automatiquement. À faire **une seule fois** :
+
+          1. Télécharge l'artefact **StealAnEgg-place** (en bas de cette page) et ouvre le .rbxl dans Roblox Studio.
+          2. **File > Publish to Roblox As... > Create new** pour créer l'expérience.
+          3. Sur https://create.roblox.com/dashboard/creations, menu ⋯ de l'expérience : copie le **Universe ID** et le **Start Place ID**.
+          4. Crée une clé API (permission **universe-places : Write** sur l'expérience, IP autorisée **0.0.0.0/0**).
+          5. Ajoute la clé en secret et les 2 IDs en variables du dépôt, puis relance ce workflow.
+          EOF
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publier le place sur Roblox
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          url="https://apis.roblox.com/universes/v1/${ROBLOX_UNIVERSE_ID}/places/${ROBLOX_PLACE_ID}/versions?versionType=${VERSION_TYPE}"
+          if ! response=$(curl --silent --show-error --fail-with-body --request POST "$url" \
+              --header "x-api-key: ${ROBLOX_API_KEY}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@${PLACE_FILE}"); then
+            echo "::error::Échec de la publication Roblox : $response"
+            exit 1
+          fi
+          echo "Réponse Roblox : $response"
+          echo "## ✅ Place publié ($VERSION_TYPE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Réponse Roblox : \`$response\`" >> "$GITHUB_STEP_SUMMARY"
